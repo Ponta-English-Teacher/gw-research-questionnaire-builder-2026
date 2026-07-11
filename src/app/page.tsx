@@ -1,420 +1,579 @@
 "use client";
-import React, { useMemo, useState, useRef, useEffect } from "react";
+import { useState } from "react";
+import { AIUnderstanding, ChatMessage, Language, Mode, Questionnaire } from "@/types/project";
+import { createEmptyProject, parseProjectJSON, projectFilename, serializeProject, ProjectValidationError } from "@/lib/project";
+import {
+  applyJapaneseReview,
+  applyTranslationStaleness,
+  mergeJapaneseTranslation,
+  migrateLegacyQuestionnaire,
+} from "@/lib/questionnaire";
+import { ValidationIssue } from "@/lib/scriptValidator";
+import { downloadFile } from "@/lib/downloadFile";
+import ResearchInputForm from "@/components/ResearchInputForm";
+import UnderstandingPanel from "@/components/UnderstandingPanel";
+import QuestionnaireEditor from "@/components/QuestionnaireEditor";
+import ChatPanel from "@/components/ChatPanel";
+import GoogleFormsExport from "@/components/GoogleFormsExport";
+import ProjectToolbar from "@/components/ProjectToolbar";
 
-type Q = { id: string; text: string; selected: boolean };
+interface JapaneseReviewSuggestion {
+  id: string;
+  label: string;
+  currentJa: string;
+  suggestedJa: string;
+  reason: string;
+}
 
-function parseList(raw: string): string[] {
-  // Accept JSON array or plain text list
-  try {
-    const j = JSON.parse(raw);
-    if (Array.isArray(j)) {
-      return j.map((x) => String(x).trim()).filter(Boolean);
-    }
-    if (Array.isArray(j?.items)) {
-      return j.items.map((x: any) => String(x).trim()).filter(Boolean);
-    }
-  } catch {}
-  // split bullets / numbers
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.replace(/^\s*[-•*]\s+/, "").replace(/^\s*\d+\.\s+/, "").trim())
-    .filter((l) => l.length > 0);
-  return lines;
+function countSelected(q: Questionnaire): number {
+  const inSection = (s: Questionnaire["participantProfile"]) => s.questions.filter((x) => x.selected).length;
+  return (
+    inSection(q.participantProfile) +
+    q.sections.reduce((sum, s) => sum + inSection(s), 0) +
+    (q.finalComments ? inSection(q.finalComments) : 0)
+  );
 }
 
 export default function Page() {
-  // ---- Step 1
-  const [topic, setTopic] = useState("Money");
-  const [keywords, setKeywords] = useState("");
-  const [summary, setSummary] = useState("");
-  const [showSummary, setShowSummary] = useState(false);
+  const [project, setProject] = useState(createEmptyProject());
 
-  // ---- Questions
-  const [questions, setQuestions] = useState<Q[]>([]);
-  const chosenCount = useMemo(
-    () => questions.filter((q) => q.selected).length,
-    [questions]
-  );
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState("");
 
-  // ---- Chat A (discuss & regenerate)
-  const [chatAInput, setChatAInput] = useState("");
-  const [chatALoading, setChatALoading] = useState(false);
-  const [chatAErr, setChatAErr] = useState("");
-  const [chatAHistory, setChatAHistory] = useState<
-    { role: "user" | "assistant"; content: string }[]
-  >([]);
+  const [generating, setGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState("");
 
-  // Last assistant message from Chat A (empty string if none yet)
-  const chatALastAnswer = useMemo(
-    () =>
-      [...chatAHistory].reverse().find((m) => m.role === "assistant")?.content ?? "",
-    [chatAHistory]
-  );
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState("");
 
-  // ---- Script Generator
-  const [scriptOutput, setScriptOutput] = useState("");
   const [scriptLoading, setScriptLoading] = useState(false);
-  const [scriptErr, setScriptErr] = useState("");
+  const [scriptError, setScriptError] = useState("");
+  const [scriptCode, setScriptCode] = useState("");
   const [scriptCopied, setScriptCopied] = useState(false);
+  const [scriptValidationIssues, setScriptValidationIssues] = useState<ValidationIssue[]>([]);
 
-  // --- helpers
-  function freshIds(texts: string[]): Q[] {
-    return texts.map((t, i) => ({
-      id: `q_${Date.now()}_${i}`,
-      text: t,
-      selected: true,
-    }));
-  }
+  const [repairErrorMessage, setRepairErrorMessage] = useState("");
+  const [repairCode, setRepairCode] = useState("");
+  const [repairLoading, setRepairLoading] = useState(false);
+  const [repairError, setRepairError] = useState("");
+  const [repairExplanation, setRepairExplanation] = useState("");
 
-  function toggleAll(on: boolean) {
-    setQuestions((prev) => prev.map((q) => ({ ...q, selected: on })));
-  }
-  function toggleOne(id: string) {
-    setQuestions((prev) =>
-      prev.map((q) => (q.id === id ? { ...q, selected: !q.selected } : q))
-    );
-  }
-  function updateText(id: string, text: string) {
-    setQuestions((prev) => prev.map((q) => (q.id === id ? { ...q, text } : q)));
-  }
+  const [planPending, setPlanPending] = useState(false);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [applyLoading, setApplyLoading] = useState(false);
+  const [updateError, setUpdateError] = useState("");
 
-  // ---- API wrappers
-  async function postChat(payload: any) {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok || !data?.ok) {
-      throw new Error(data?.error || "API error");
-    }
-    return String(data.text || "");
+  const [translating, setTranslating] = useState(false);
+  const [translateError, setTranslateError] = useState("");
+  const [scriptLanguage, setScriptLanguage] = useState<Language>("english");
+
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+  const [includeManualEdits, setIncludeManualEdits] = useState(false);
+  const [reviewPending, setReviewPending] = useState(false);
+  const [reviewSuggestions, setReviewSuggestions] = useState<JapaneseReviewSuggestion[]>([]);
+  const [reviewedCount, setReviewedCount] = useState(0);
+  const [skippedManualEdits, setSkippedManualEdits] = useState(0);
+  const [applyingReview, setApplyingReview] = useState(false);
+
+  function patchProject(patch: Partial<typeof project>) {
+    setProject((prev) => ({ ...prev, ...patch }));
   }
 
-  // ---- Step 1: summary
-  async function handleGenerateSummary() {
+  function dismissJapaneseReview() {
+    setReviewPending(false);
+    setReviewSuggestions([]);
+    setReviewError("");
+  }
+
+  // Every edit to the questionnaire runs through here so an existing "current"
+  // translation is flipped to "stale" the moment English content changes.
+  function handleQuestionnaireChange(updated: Questionnaire) {
+    patchProject({ questionnaire: applyTranslationStaleness(updated) });
+  }
+
+  // ---- Step 1: Analyze Research ----
+  async function handleAnalyze() {
+    setAnalyzing(true);
+    setAnalyzeError("");
     try {
-      const baseMsg = `Topic: ${topic}\nKeywords: ${keywords}\nSummarize the study focus in 1–2 sentences for internal notes.`;
-      const txt = await postChat({
-        mode: "chat",
-        topic,
-        keywords,
-        message: baseMsg,
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: project.title,
+          introduction: project.introduction,
+          specialInterest: project.specialInterest,
+          hypothesis: project.hypothesis,
+          mode: project.mode,
+        }),
       });
-      setSummary(txt);
-      setShowSummary(true);
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Analyze failed.");
+      patchProject({ aiUnderstanding: data.understanding as AIUnderstanding });
     } catch (e: any) {
-      alert("Summary error: " + e.message);
-    }
-  }
-
-  // ---- Step 2: GENERATE questions (explicit button; no auto-overwrite)
-  async function handleGenerateQuestions() {
-    try {
-      const txt = await postChat({
-        mode: "generate",
-        topic,
-        keywords,
-        summary,
-      });
-      const list = parseList(txt);
-      if (!list.length) throw new Error("No questions recognized.");
-      setQuestions(freshIds(list));
-      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-    } catch (e: any) {
-      alert("Generate error: " + e.message);
-    }
-  }
-
-  // ---- Chat A send (does NOT regenerate automatically)
-  async function handleChatASend() {
-    if (!chatAInput.trim()) return;
-    const userMsg = { role: "user" as const, content: chatAInput.trim() };
-    setChatAHistory((h) => [...h, userMsg]);
-    setChatAInput("");
-    setChatALoading(true);
-    setChatAErr("");
-    try {
-      const txt = await postChat({
-        mode: "chat",
-        topic,
-        keywords,
-        summary,
-        questions: questions.map((q) => q.text),
-        selectedQuestions: questions.filter((q) => q.selected).map((q) => q.text),
-        message: userMsg.content,
-        history: chatAHistory,
-      });
-      setChatAHistory((h) => [...h, { role: "assistant", content: txt }]);
-    } catch (e: any) {
-      setChatAErr(e.message);
+      setAnalyzeError(e.message || String(e));
     } finally {
-      setChatALoading(false);
+      setAnalyzing(false);
     }
   }
 
-  // ---- Chat A regenerate now (replaces list)
-  async function handleRegenerateFromChatA() {
-    setChatALoading(true);
-    setChatAErr("");
-    try {
-      const txt = await postChat({
-        mode: "regenerate",
-        topic,
-        keywords,
-        summary,
-        questions: questions.map((q) => q.text),
-        selectedQuestions: questions.filter((q) => q.selected).map((q) => q.text),
-        history: chatAHistory,
-        message:
-          "Regenerate the full list of 8–10 concise survey questions now, reflecting the discussion.",
-      });
-      const list = parseList(txt);
-      if (!list.length) throw new Error("No questions recognized.");
-      setQuestions(freshIds(list));
-      setChatAHistory((h) => [
-        ...h,
-        { role: "assistant", content: "✅ Regenerated the question list." },
-      ]);
-    } catch (e: any) {
-      setChatAErr(e.message);
-    } finally {
-      setChatALoading(false);
-    }
-  }
-
-  // ---- Script Generator
-  async function handleGenerateScript() {
-    const selected = questions.filter((q) => q.selected).map((q) => q.text);
-    const hasSource = chatALastAnswer.trim() !== "" || selected.length > 0;
-    if (!hasSource) {
-      setScriptErr(
-        "No questionnaire available. Generate questions in Step 2, or use Chat A to build the final questionnaire first."
+  // ---- Step 2: Generate Questionnaire ----
+  async function handleGenerateQuestionnaire() {
+    if (!project.aiUnderstanding) return;
+    if (project.questionnaire) {
+      const proceed = window.confirm(
+        "This replaces your current questionnaire draft with a new one. Continue?"
       );
-      return;
+      if (!proceed) return;
     }
+    setGenerating(true);
+    setGenerateError("");
+    try {
+      const res = await fetch("/api/generate-questionnaire", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: project.title,
+          introduction: project.introduction,
+          specialInterest: project.specialInterest,
+          hypothesis: project.hypothesis,
+          mode: project.mode,
+          understanding: { ...project.aiUnderstanding, approved: true },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Generation failed.");
+      patchProject({
+        questionnaire: data.questionnaire as Questionnaire,
+        aiUnderstanding: { ...project.aiUnderstanding, approved: true },
+      });
+      setScriptCode("");
+      setScriptLanguage("english");
+      setTranslateError("");
+      dismissJapaneseReview();
+    } catch (e: any) {
+      setGenerateError(e.message || String(e));
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  // ---- Chat: AI editing assistant ----
+  async function handleChatSend(message: string) {
+    const userMsg: ChatMessage = { role: "user", content: message, timestamp: new Date().toISOString() };
+    const nextHistory = [...project.chatHistory, userMsg];
+    patchProject({ chatHistory: nextHistory });
+    setChatLoading(true);
+    setChatError("");
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: project.title,
+          mode: project.mode,
+          understanding: project.aiUnderstanding,
+          questionnaire: project.questionnaire,
+          message,
+          history: project.chatHistory.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Chat failed.");
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        content: String(data.text || ""),
+        timestamp: new Date().toISOString(),
+      };
+      setProject((prev) => ({ ...prev, chatHistory: [...prev.chatHistory, assistantMsg] }));
+    } catch (e: any) {
+      setChatError(e.message || String(e));
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  // ---- Research Partner: Update Questionnaire (plan, then confirm) ----
+  async function handleRequestUpdatePlan() {
+    if (!project.questionnaire) return;
+    setPlanLoading(true);
+    setUpdateError("");
+    try {
+      const res = await fetch("/api/update-questionnaire", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: "plan",
+          title: project.title,
+          introduction: project.introduction,
+          specialInterest: project.specialInterest,
+          hypothesis: project.hypothesis,
+          mode: project.mode,
+          understanding: project.aiUnderstanding,
+          questionnaire: project.questionnaire,
+          chatHistory: project.chatHistory.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Could not prepare an update plan.");
+      const planMsg: ChatMessage = {
+        role: "assistant",
+        content: String(data.plan || ""),
+        timestamp: new Date().toISOString(),
+      };
+      setProject((prev) => ({ ...prev, chatHistory: [...prev.chatHistory, planMsg] }));
+      setPlanPending(true);
+    } catch (e: any) {
+      setUpdateError(e.message || String(e));
+    } finally {
+      setPlanLoading(false);
+    }
+  }
+
+  async function handleConfirmUpdate() {
+    if (!project.questionnaire) return;
+    setApplyLoading(true);
+    setUpdateError("");
+    try {
+      const res = await fetch("/api/update-questionnaire", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: "apply",
+          title: project.title,
+          introduction: project.introduction,
+          specialInterest: project.specialInterest,
+          hypothesis: project.hypothesis,
+          mode: project.mode,
+          understanding: project.aiUnderstanding,
+          questionnaire: project.questionnaire,
+          chatHistory: project.chatHistory.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Could not apply the update.");
+      const confirmMsg: ChatMessage = {
+        role: "assistant",
+        content: "✅ The questionnaire has been updated based on our discussion. Feel free to keep editing or continue talking it through.",
+        timestamp: new Date().toISOString(),
+      };
+      setProject((prev) => ({
+        ...prev,
+        questionnaire: data.questionnaire as Questionnaire,
+        chatHistory: [...prev.chatHistory, confirmMsg],
+      }));
+      setScriptCode("");
+      setPlanPending(false);
+      dismissJapaneseReview();
+    } catch (e: any) {
+      setUpdateError(e.message || String(e));
+    } finally {
+      setApplyLoading(false);
+    }
+  }
+
+  function handleCancelUpdate() {
+    setPlanPending(false);
+    setUpdateError("");
+  }
+
+  // ---- Translation: Generate Japanese Version / Update Translation ----
+  async function handleTranslate() {
+    if (!project.questionnaire) return;
+    setTranslating(true);
+    setTranslateError("");
+    try {
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questionnaire: project.questionnaire }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Translation failed.");
+      const merged = mergeJapaneseTranslation(project.questionnaire, data.translation);
+      patchProject({ questionnaire: merged });
+      dismissJapaneseReview();
+    } catch (e: any) {
+      setTranslateError(e.message || String(e));
+    } finally {
+      setTranslating(false);
+    }
+  }
+
+  // ---- Improve Japanese Wording: dedicated naturalness review ----
+  async function handleReviewJapanese() {
+    if (!project.questionnaire) return;
+    setReviewLoading(true);
+    setReviewError("");
+    try {
+      const res = await fetch("/api/review-japanese", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: project.title,
+          mode: project.mode,
+          questionnaire: project.questionnaire,
+          includeManualEdits,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Review failed.");
+      setReviewSuggestions(data.suggestions || []);
+      setReviewedCount(data.reviewedCount ?? 0);
+      setSkippedManualEdits(data.skippedManualEdits ?? 0);
+      setReviewPending(true);
+    } catch (e: any) {
+      setReviewError(e.message || String(e));
+    } finally {
+      setReviewLoading(false);
+    }
+  }
+
+  function handleApplyJapaneseReview() {
+    if (!project.questionnaire || reviewSuggestions.length === 0) return;
+    setApplyingReview(true);
+    const updated = applyJapaneseReview(
+      project.questionnaire,
+      reviewSuggestions.map((s) => ({ id: s.id, suggestedJa: s.suggestedJa }))
+    );
+    patchProject({ questionnaire: updated });
+    setApplyingReview(false);
+    dismissJapaneseReview();
+  }
+
+  // ---- Google Forms export ----
+  async function handleGenerateScript() {
+    if (!project.questionnaire) return;
     setScriptLoading(true);
-    setScriptErr("");
-    setScriptOutput("");
+    setScriptError("");
+    setScriptCode("");
     setScriptCopied(false);
+    setScriptValidationIssues([]);
     try {
       const res = await fetch("/api/generate-script", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: topic || "Research Questionnaire",
-          // Pass Chat A's final answer as primary source; API falls back to questions[] if absent
-          chatAFinalAnswer: chatALastAnswer.trim() || undefined,
-          questions: selected,
-        }),
+        body: JSON.stringify({ title: project.title, questionnaire: project.questionnaire, language: scriptLanguage }),
       });
       const data = await res.json();
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || "API error");
-      }
-      setScriptOutput(String(data.code || ""));
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Script generation failed.");
+      const code = String(data.code || "");
+      setScriptCode(code);
+      setScriptValidationIssues(data.validation?.issues || []);
+      // Keep the Repair Script box in sync with whatever was just generated.
+      setRepairCode(code);
+      setRepairErrorMessage("");
+      setRepairExplanation("");
+      setRepairError("");
     } catch (e: any) {
-      setScriptErr(e.message);
+      setScriptError(e.message || String(e));
     } finally {
       setScriptLoading(false);
     }
   }
 
   async function handleCopyScript() {
-    if (!scriptOutput) return;
-    await navigator.clipboard.writeText(scriptOutput);
+    if (!scriptCode) return;
+    await navigator.clipboard.writeText(scriptCode);
     setScriptCopied(true);
     setTimeout(() => setScriptCopied(false), 2000);
   }
 
-  // ---- UI
+  // ---- Repair Script: second, independent recovery workflow ----
+  async function handleRepairScript() {
+    if (!repairErrorMessage.trim() && !repairCode.trim()) return;
+    setRepairLoading(true);
+    setRepairError("");
+    try {
+      const res = await fetch("/api/repair-script", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: project.title, errorMessage: repairErrorMessage, code: repairCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Repair failed.");
+      const fixedCode = String(data.code || "");
+      setRepairExplanation(String(data.explanation || ""));
+      setRepairCode(fixedCode);
+      // The main script panel always reflects the latest known-good version.
+      setScriptCode(fixedCode);
+      setScriptValidationIssues(data.validation?.issues || []);
+      setScriptCopied(false);
+    } catch (e: any) {
+      setRepairError(e.message || String(e));
+    } finally {
+      setRepairLoading(false);
+    }
+  }
+
+  // ---- Save / Open Project ----
+  function handleSave() {
+    downloadFile(projectFilename(project), serializeProject(project), "application/json");
+  }
+
+  function handleOpenFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = parseProjectJSON(String(reader.result || ""));
+        const migrated = parsed.questionnaire ? migrateLegacyQuestionnaire(parsed.questionnaire) : null;
+        setProject({ ...parsed, questionnaire: migrated });
+        setScriptCode("");
+        setScriptLanguage("english");
+        setScriptValidationIssues([]);
+        setRepairErrorMessage("");
+        setRepairCode("");
+        setRepairError("");
+        setRepairExplanation("");
+        setAnalyzeError("");
+        setGenerateError("");
+        setChatError("");
+        setPlanPending(false);
+        setUpdateError("");
+        setTranslateError("");
+        dismissJapaneseReview();
+        setIncludeManualEdits(false);
+      } catch (e: any) {
+        const message = e instanceof ProjectValidationError ? e.message : "Could not open this project file.";
+        alert(message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleNewProject() {
+    const proceed = window.confirm("Start a new project? Any unsaved work will be lost.");
+    if (!proceed) return;
+    setProject(createEmptyProject());
+    setScriptCode("");
+    setScriptLanguage("english");
+    setScriptValidationIssues([]);
+    setRepairErrorMessage("");
+    setRepairCode("");
+    setRepairError("");
+    setRepairExplanation("");
+    setAnalyzeError("");
+    setGenerateError("");
+    setChatError("");
+    setPlanPending(false);
+    setUpdateError("");
+    setTranslateError("");
+    dismissJapaneseReview();
+    setIncludeManualEdits(false);
+  }
+
   return (
-    <main className="mx-auto max-w-4xl p-6 space-y-10">
-      <h1 className="text-2xl font-bold">Smart Research Questionnaire Builder</h1>
-      <p className="text-sm text-gray-600">
-        A simple, AI-assisted flow for Topics → Keywords → Questionnaire.
-        Use <b>Chat A</b> to discuss and refine, then generate a Google Form script below.
-      </p>
-
-      {/* ---- Step 1 */}
-      <section className="space-y-4">
-        <h2 className="text-xl font-semibold">Step 1 — Topic & Keywords</h2>
-        <input
-          className="w-full rounded-md border p-2"
-          value={topic}
-          onChange={(e) => setTopic(e.target.value)}
-          placeholder="e.g., Sleep"
-        />
-        <input
-          className="w-full rounded-md border p-2"
-          value={keywords}
-          onChange={(e) => setKeywords(e.target.value)}
-          placeholder="e.g., quality, bedtime routines, caffeine, screen time"
-        />
-        <div className="flex gap-2">
-          <button className="rounded-md px-3 py-2 text-sm border" onClick={handleGenerateSummary}>
-            Generate Step 1 Summary
-          </button>
-          <button
-            className="rounded-md px-3 py-2 text-sm border"
-            onClick={() => setShowSummary((v) => !v)}
-          >
-            {showSummary ? "Hide Summary" : "Show Summary"}
-          </button>
-        </div>
-        {showSummary && (
-          <div className="rounded-md border p-3 text-sm bg-gray-50 whitespace-pre-wrap">
-            {summary || <i>(no summary yet)</i>}
-          </div>
-        )}
-      </section>
-
-      {/* ---- Step 2 */}
-      <section className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold">Step 2 — Questionnaire (editable & selectable)</h2>
-          <div className="flex gap-2">
-            <button className="rounded-md px-3 py-2 text-sm border" onClick={handleGenerateQuestions}>
-              Generate Questions
-            </button>
-            <button className="rounded-md px-3 py-2 text-sm border" onClick={() => toggleAll(true)}>
-              Select All
-            </button>
-            <button className="rounded-md px-3 py-2 text-sm border" onClick={() => toggleAll(false)}>
-              Deselect All
-            </button>
-          </div>
-        </div>
-        <p className="text-sm text-gray-600">
-          Edit any question text. Use the checkbox to include/exclude. Selected:{" "}
-          <b>{chosenCount}</b> / {questions.length}
-        </p>
-
-        <ol className="space-y-3 list-decimal pl-5">
-          {questions.map((q) => (
-            <li key={q.id} className="space-y-2">
-              <div className="flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  className="mt-2"
-                  checked={q.selected}
-                  onChange={() => toggleOne(q.id)}
-                />
-                <textarea
-                  className="flex-1 rounded-md border p-2"
-                  value={q.text}
-                  onChange={(e) => updateText(q.id, e.target.value)}
-                />
-              </div>
-              <div className="text-xs text-gray-500">ID: {q.id}</div>
-            </li>
-          ))}
-        </ol>
-      </section>
-
-      {/* ---- Chat A */}
-      <section className="space-y-3 rounded-lg border p-3 bg-gray-50">
-        <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold">Chat A — discuss & regenerate</div>
-          <button
-            className="rounded-md px-3 py-1 text-sm border"
-            onClick={handleRegenerateFromChatA}
-            disabled={chatALoading}
-          >
-            {chatALoading ? "Regenerating..." : "Regenerate now"}
-          </button>
-        </div>
-
-        <div className="space-y-2 max-h-64 overflow-auto bg-white rounded-md border p-2">
-          {chatAHistory.length === 0 && (
-            <div className="text-xs text-gray-500">
-              Tip: Tell the assistant how to reshape the set (e.g., “merge 1 & 2”, “use more Likert
-              wording”, “focus on weekend spending”).
-            </div>
-          )}
-          {chatAHistory.map((m, i) => (
-            <div key={i} className={m.role === "user" ? "text-sm" : "text-sm bg-gray-100 p-2 rounded"}>
-              <b>{m.role === "user" ? "You" : "Assistant"}:</b> {m.content}
-            </div>
-          ))}
-          {chatAErr && <div className="text-xs text-red-600">Error: {chatAErr}</div>}
-        </div>
-
-        <input
-          className="w-full rounded-md border p-2"
-          placeholder='e.g., “1 and 2 overlap; merge into one Likert question about budgeting.”'
-          value={chatAInput}
-          onChange={(e) => setChatAInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if (!chatALoading) handleChatASend();
-            }
-          }}
-        />
-        <div className="text-xs text-gray-500">
-          Press <b>Enter</b> to send — <b>Shift+Enter</b> for a new line.
-        </div>
-      </section>
-
-      {/* ---- Google Forms Apps Script Generator */}
-      <section className="space-y-3 rounded-lg border border-blue-200 bg-blue-50 p-4">
-        <div className="text-sm font-semibold text-blue-900">
-          Google Forms Apps Script Generator
-        </div>
-        <p className="text-xs text-blue-700">
-          {chatALastAnswer.trim()
-            ? "Source: Chat A additions + Step 2 questions (merged — Chat A sections come first)."
-            : "Source: selected Step 2 questions (no Chat A answer yet)."}
-          {" "}Paste the code directly into Apps Script — no editing needed.
-        </p>
-
-        <button
-          className="w-full rounded-md px-4 py-2.5 text-sm font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          onClick={handleGenerateScript}
-          disabled={scriptLoading || (!chatALastAnswer.trim() && chosenCount === 0)}
-        >
-          {scriptLoading
-            ? "Generating script…"
-            : chatALastAnswer.trim()
-            ? "Generate Google Form Script (Chat A + Step 2 merged)"
-            : `Generate Google Form Script from Selected Questions (${chosenCount})`}
-        </button>
-
-        {!chatALastAnswer.trim() && chosenCount === 0 && (
-          <p className="text-xs text-amber-700">
-            Generate questions in Step 2, or use Chat A to finalize the questionnaire first.
+    <main className="mx-auto max-w-4xl p-6 space-y-6">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">GW Research Questionnaire Builder 2026</h1>
+          <p className="text-sm text-gray-600">
+            Describe your research, confirm our understanding of it, then build a professional
+            questionnaire — ready for Google Forms.
           </p>
-        )}
+        </div>
+        <ProjectToolbar onSave={handleSave} onOpenFile={handleOpenFile} onNewProject={handleNewProject} />
+      </header>
 
-        {scriptErr && (
-          <p className="text-xs text-red-600">Error: {scriptErr}</p>
-        )}
+      <ResearchInputForm
+        title={project.title}
+        introduction={project.introduction}
+        specialInterest={project.specialInterest}
+        hypothesis={project.hypothesis}
+        mode={project.mode}
+        onTitleChange={(v) => patchProject({ title: v })}
+        onIntroductionChange={(v) => patchProject({ introduction: v })}
+        onSpecialInterestChange={(v) => patchProject({ specialInterest: v })}
+        onHypothesisChange={(v) => patchProject({ hypothesis: v })}
+        onModeChange={(m: Mode) => patchProject({ mode: m })}
+        onAnalyze={handleAnalyze}
+        analyzing={analyzing}
+        error={analyzeError}
+      />
 
-        {scriptOutput && (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-blue-700">
-                Copy and paste into{" "}
-                <strong>Google Apps Script</strong> (script.google.com).
-              </span>
-              <button
-                className="rounded-md px-4 py-1.5 text-sm font-medium border border-blue-300 bg-white text-blue-700 hover:bg-blue-50 transition-colors"
-                onClick={handleCopyScript}
-              >
-                {scriptCopied ? "✓ Copied!" : "Copy Code"}
-              </button>
-            </div>
-            <pre className="overflow-auto rounded-md bg-gray-950 text-green-300 text-xs p-4 font-mono whitespace-pre leading-relaxed">
-              {scriptOutput}
-            </pre>
-          </div>
-        )}
-      </section>
+      {project.aiUnderstanding && (
+        <UnderstandingPanel
+          understanding={project.aiUnderstanding}
+          onChange={(updated) => patchProject({ aiUnderstanding: updated })}
+          onGenerate={handleGenerateQuestionnaire}
+          generating={generating}
+          error={generateError}
+        />
+      )}
+
+      {project.questionnaire && (
+        <>
+          <QuestionnaireEditor
+            questionnaire={project.questionnaire}
+            onChange={handleQuestionnaireChange}
+            onTranslate={handleTranslate}
+            translating={translating}
+            translateError={translateError}
+            onReview={handleReviewJapanese}
+            reviewLoading={reviewLoading}
+            reviewError={reviewError}
+            includeManualEdits={includeManualEdits}
+            onIncludeManualEditsChange={setIncludeManualEdits}
+            reviewPending={reviewPending}
+            reviewSuggestions={reviewSuggestions}
+            reviewedCount={reviewedCount}
+            skippedManualEdits={skippedManualEdits}
+            onApplyReview={handleApplyJapaneseReview}
+            onCancelReview={dismissJapaneseReview}
+            applyingReview={applyingReview}
+          />
+
+          <ChatPanel
+            history={project.chatHistory}
+            onSend={handleChatSend}
+            loading={chatLoading}
+            error={chatError}
+            onRequestUpdate={handleRequestUpdatePlan}
+            onConfirmUpdate={handleConfirmUpdate}
+            onCancelUpdate={handleCancelUpdate}
+            planPending={planPending}
+            planLoading={planLoading}
+            applyLoading={applyLoading}
+            updateError={updateError}
+          />
+
+          <GoogleFormsExport
+            onGenerate={handleGenerateScript}
+            loading={scriptLoading}
+            error={scriptError}
+            code={scriptCode}
+            onCopy={handleCopyScript}
+            copied={scriptCopied}
+            disabled={countSelected(project.questionnaire) === 0}
+            language={scriptLanguage}
+            onLanguageChange={setScriptLanguage}
+            hasJapanese={project.questionnaire.translation.status !== "none"}
+            validationIssues={scriptValidationIssues}
+            repairErrorMessage={repairErrorMessage}
+            onRepairErrorMessageChange={setRepairErrorMessage}
+            repairCode={repairCode}
+            onRepairCodeChange={setRepairCode}
+            onRepairSubmit={handleRepairScript}
+            repairLoading={repairLoading}
+            repairError={repairError}
+            repairExplanation={repairExplanation}
+          />
+
+          <section className="rounded-2xl border bg-white p-6 space-y-2 shadow-sm">
+            <h2 className="text-sm font-semibold text-gray-700">Notes</h2>
+            <textarea
+              className="w-full rounded-md border p-2.5 min-h-[80px] text-sm"
+              placeholder="Any personal notes for yourself — saved with the project, not shown to the AI."
+              value={project.notes}
+              onChange={(e) => patchProject({ notes: e.target.value })}
+            />
+          </section>
+        </>
+      )}
 
       <footer className="text-center text-xs text-gray-500 mt-10 border-t pt-4">
-        Smart Research Questionnaire Builder © 2025  
+        GW Research Questionnaire Builder 2026 <br />
         Developed by <b>Professor Hitoshi Eguchi</b> — Hokusei Gakuen University, Sapporo, Japan
       </footer>
     </main>

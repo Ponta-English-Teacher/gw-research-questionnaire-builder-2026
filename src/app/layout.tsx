@@ -5,8 +5,8 @@ import { Inter } from "next/font/google";
 const inter = Inter({ subsets: ["latin"], display: "swap" });
 
 export const metadata: Metadata = {
-  title: "Smart Research Questionnaire Builder",
-  description: "Build simple research questionnaires step by step",
+  title: "GW Research Questionnaire Builder 2026",
+  description: "AI-assisted research questionnaire design, from introduction to Google Forms",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
