@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI } from "@/lib/openai";
 import { renderJapaneseStyleGuide } from "@/lib/japaneseStyleGuide";
@@ -110,6 +111,9 @@ function buildRewriteUserPrompt(fields: JapaneseFieldRef[], meanings: Pass1Resul
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = (await req.json()) as ReviewBody;
     const questionnaire = body.questionnaire ?? null;

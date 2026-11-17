@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI, ChatTurn } from "@/lib/openai";
 import { renderJapaneseStyleGuide } from "@/lib/japaneseStyleGuide";
@@ -167,6 +168,9 @@ function buildApplyUserPrompt(body: UpdateBody, bilingual: boolean): string {
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = (await req.json()) as UpdateBody;
 

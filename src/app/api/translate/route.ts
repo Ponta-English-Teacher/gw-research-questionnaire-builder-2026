@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI } from "@/lib/openai";
 import { renderJapaneseStyleGuide } from "@/lib/japaneseStyleGuide";
@@ -67,6 +68,9 @@ function mockTranslate(resolved: ResolvedQuestionnaire) {
 }
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = await req.json();
     const questionnaire: Questionnaire | null = body?.questionnaire ?? null;

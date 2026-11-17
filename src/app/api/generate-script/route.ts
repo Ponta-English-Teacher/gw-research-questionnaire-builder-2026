@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI, stripFences } from "@/lib/openai";
 import { ResolvedQuestion, ResolvedQuestionnaire, ResolvedSection, resolveQuestionnaireLanguage } from "@/lib/questionnaire";
@@ -264,6 +265,9 @@ function buildScriptFromQuestionnaire(title: string, q: ResolvedQuestionnaire): 
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = await req.json();
     const title: string = String(body?.title || "Research Questionnaire").trim();

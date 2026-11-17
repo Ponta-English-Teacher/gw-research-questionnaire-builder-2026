@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI, stripFences } from "@/lib/openai";
 import { validateAndRepairScript } from "@/lib/scriptValidator";
@@ -63,6 +64,9 @@ function mockRepair(body: RepairBody): { explanation: string; code: string } {
 }
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = (await req.json()) as RepairBody;
     const title = String(body?.title || "Research Questionnaire").trim();

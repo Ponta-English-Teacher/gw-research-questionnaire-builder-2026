@@ -1,3 +1,4 @@
+import { requireAuth } from "@/lib/auth";
 import { NextRequest, NextResponse } from "next/server";
 import { API_KEY, callOpenAI, ChatTurn } from "@/lib/openai";
 import { summarizeQuestionnaire } from "@/lib/questionnaire";
@@ -78,6 +79,9 @@ Try asking something specific, like "add a question about frequency of use to Se
 }
 
 export async function POST(req: NextRequest) {
+  const denied = requireAuth(req);
+  if (denied) return denied;
+
   try {
     const body = (await req.json()) as ChatBody;
     if (!body.message?.trim()) {
