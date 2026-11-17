@@ -109,7 +109,7 @@ export default function AuthGate({ children }: { children: ReactNode }) {
   }, []);
 
   async function logout() {
-    if (!window.confirm("Log out? Any unsaved project will be cleared from this screen — use Save Project first.")) return;
+    if (!window.confirm("Log out? Any unsaved project will be cleared from this screen — use Save Project (JSON) first.")) return;
     try {
       await fetch("/api/auth/logout", { method: "POST" });
     } catch {}

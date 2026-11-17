@@ -1,7 +1,16 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AIUnderstanding, ChatMessage, Language, Mode, Questionnaire } from "@/types/project";
-import { createEmptyProject, parseProjectJSON, projectFilename, serializeProject, ProjectValidationError } from "@/lib/project";
+import {
+  createEmptyProject,
+  parseProjectJSON,
+  projectFilename,
+  projectFingerprint,
+  readSession,
+  serializeProject,
+  SessionExtras,
+  ProjectValidationError,
+} from "@/lib/project";
 import {
   applyJapaneseReview,
   applyTranslationStaleness,
@@ -75,6 +84,38 @@ export default function Page() {
   const [reviewedCount, setReviewedCount] = useState(0);
   const [skippedManualEdits, setSkippedManualEdits] = useState(0);
   const [applyingReview, setApplyingReview] = useState(false);
+
+  // ---- Unsaved-changes tracking ----
+  function currentSession(): SessionExtras {
+    return {
+      scriptCode,
+      scriptLanguage,
+      scriptValidationIssues,
+      repairErrorMessage,
+      repairCode,
+      repairExplanation,
+      planPending,
+      reviewPending,
+      reviewSuggestions,
+      reviewedCount,
+      skippedManualEdits,
+      includeManualEdits,
+    };
+  }
+  const fingerprint = projectFingerprint(project, currentSession());
+  const savedFingerprint = useRef<string>(fingerprint);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = fingerprint !== savedFingerprint.current;
+
+  useEffect(() => {
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (!dirtyRef.current) return;
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
 
   function patchProject(patch: Partial<typeof project>) {
     setProject((prev) => ({ ...prev, ...patch }));
@@ -409,31 +450,26 @@ export default function Page() {
 
   // ---- Save / Open Project ----
   function handleSave() {
-    downloadFile(projectFilename(project), serializeProject(project), "application/json");
+    const session = currentSession();
+    downloadFile(projectFilename(project), serializeProject(project, session), "application/json");
+    savedFingerprint.current = projectFingerprint(project, session);
+    dirtyRef.current = false; // refs don't re-render; clear immediately so the warning stops right away
   }
 
   function handleOpenFile(file: File) {
+    if (dirtyRef.current && !window.confirm("You have unsaved changes. Opening another project will discard them. Continue?")) {
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       try {
         const parsed = parseProjectJSON(String(reader.result || ""));
         const migrated = parsed.questionnaire ? migrateLegacyQuestionnaire(parsed.questionnaire) : null;
-        setProject({ ...parsed, questionnaire: migrated });
-        setScriptCode("");
-        setScriptLanguage("english");
-        setScriptValidationIssues([]);
-        setRepairErrorMessage("");
-        setRepairCode("");
-        setRepairError("");
-        setRepairExplanation("");
-        setAnalyzeError("");
-        setGenerateError("");
-        setChatError("");
-        setPlanPending(false);
-        setUpdateError("");
-        setTranslateError("");
-        dismissJapaneseReview();
-        setIncludeManualEdits(false);
+        const loaded = { ...parsed, questionnaire: migrated };
+        const session = readSession(loaded); // no AI calls: restores saved work only
+        setProject(loaded);
+        applySession(session);
+        savedFingerprint.current = projectFingerprint(loaded, session);
       } catch (e: any) {
         const message = e instanceof ProjectValidationError ? e.message : "Could not open this project file.";
         alert(message);
@@ -442,10 +478,37 @@ export default function Page() {
     reader.readAsText(file);
   }
 
+  function applySession(s: SessionExtras) {
+    setScriptCode(s.scriptCode);
+    setScriptLanguage(s.scriptLanguage);
+    setScriptValidationIssues(s.scriptValidationIssues);
+    setScriptCopied(false);
+    setRepairErrorMessage(s.repairErrorMessage);
+    setRepairCode(s.repairCode);
+    setRepairExplanation(s.repairExplanation);
+    setRepairError("");
+    setPlanPending(s.planPending);
+    setReviewPending(s.reviewPending);
+    setReviewSuggestions(s.reviewSuggestions);
+    setReviewedCount(s.reviewedCount);
+    setSkippedManualEdits(s.skippedManualEdits);
+    setIncludeManualEdits(s.includeManualEdits);
+    setReviewError("");
+    setAnalyzeError("");
+    setGenerateError("");
+    setChatError("");
+    setUpdateError("");
+    setTranslateError("");
+  }
+
   function handleNewProject() {
-    const proceed = window.confirm("Start a new project? Any unsaved work will be lost.");
+    const proceed = window.confirm(
+      dirtyRef.current ? "You have unsaved changes. Start a new project and discard them?" : "Start a new project?"
+    );
     if (!proceed) return;
-    setProject(createEmptyProject());
+    const fresh = createEmptyProject();
+    setProject(fresh);
+    savedFingerprint.current = projectFingerprint(fresh, readSession(fresh));
     setScriptCode("");
     setScriptLanguage("english");
     setScriptValidationIssues([]);

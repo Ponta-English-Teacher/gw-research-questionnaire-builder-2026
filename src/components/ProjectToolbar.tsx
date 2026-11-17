@@ -29,14 +29,14 @@ export default function ProjectToolbar({ onSave, onOpenFile, onNewProject }: Pro
         onClick={onSave}
         className="rounded-md border px-3 py-1.5 text-sm font-medium bg-white hover:bg-gray-50"
       >
-        Save Project
+        Save Project (JSON)
       </button>
       <button
         type="button"
         onClick={() => fileInputRef.current?.click()}
         className="rounded-md border px-3 py-1.5 text-sm font-medium bg-white hover:bg-gray-50"
       >
-        Open Project
+        Open Project (JSON)
       </button>
       <input
         ref={fileInputRef}
